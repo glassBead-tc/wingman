@@ -1,9 +1,31 @@
 """Pytest configuration and fixtures."""
 
+import json
+from pathlib import Path
+
 import pytest
 
 # Enable async tests without marking each one
 pytest_plugins = ["pytest_asyncio"]
+
+
+@pytest.fixture
+def mcp_config():
+    """Load MCP server configuration from .mcp.json."""
+    config_path = Path(__file__).parent.parent / ".mcp.json"
+    if not config_path.exists():
+        pytest.skip("No .mcp.json found")
+    with open(config_path) as f:
+        return json.load(f)
+
+
+@pytest.fixture
+def thoughtbox_config(mcp_config):
+    """Get Thoughtbox server configuration."""
+    servers = mcp_config.get("mcpServers", {})
+    if "thoughtbox" not in servers:
+        pytest.skip("Thoughtbox not configured in .mcp.json")
+    return servers["thoughtbox"]
 
 
 @pytest.fixture

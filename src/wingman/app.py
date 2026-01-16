@@ -27,6 +27,8 @@ from .config import (
     load_api_key,
     load_instructions,
 )
+from .mcp.config import MCPServerConfig, load_mcp_config
+from .mcp.integration.bridge import HybridConfig, HybridMCPBridge
 from .context import AUTO_COMPACT_THRESHOLD
 from .export import export_session_json, export_session_markdown, import_session_from_file
 from .images import CachedImage, cache_image_immediately, create_image_message_from_cache, is_image_path
@@ -99,6 +101,9 @@ class WingmanApp(App):
         self.panels: list[ChatPanel] = []
         self.active_panel_idx: int = 0
         self.last_ctrl_c: float | None = None
+        # Direct MCP connections
+        self.mcp_configs: dict[str, MCPServerConfig] = {}
+        self.mcp_bridge: HybridMCPBridge | None = None
 
     def _init_client(self, api_key: str) -> None:
         """Initialize Dedalus client with API key."""
@@ -144,11 +149,32 @@ class WingmanApp(App):
 
     @work(thread=False)
     async def _init_dynamic_data(self) -> None:
-        """Fetch marketplace servers from API."""
+        """Fetch marketplace servers and load MCP configs."""
+        # Fetch marketplace servers
         servers = await fetch_marketplace_servers()
         if servers:
             MARKETPLACE_SERVERS.clear()
             MARKETPLACE_SERVERS.extend(servers)
+
+        # Load direct MCP server configs
+        working_dir = self.active_panel.working_dir if self.active_panel else None
+        self.mcp_configs = load_mcp_config(working_dir)
+
+        # Initialize bridge if we have configs
+        if self.mcp_configs:
+            self.mcp_bridge = HybridMCPBridge(
+                HybridConfig(
+                    dedalus_client=self.client,
+                    server_configs=self.mcp_configs,
+                )
+            )
+            try:
+                await self.mcp_bridge.initialize()
+                count = len(self.mcp_bridge.get_connected_servers())
+                if count:
+                    self.notify(f"Connected to {count} MCP server(s)", timeout=3.0)
+            except Exception as e:
+                self.notify(f"MCP connection error: {e}", severity="error", timeout=5.0)
 
     def _check_background_processes(self) -> None:
         """Periodic check for completed background processes."""
@@ -171,7 +197,10 @@ class WingmanApp(App):
     def _update_status(self) -> None:
         model_short = self.model.split("/")[-1]
         panel = self.active_panel
-        mcp_count = len(panel.mcp_servers) if panel else 0
+        # Count both Dedalus and direct MCP servers
+        dedalus_count = len(panel.mcp_servers) if panel else 0
+        direct_count = len(self.mcp_bridge.get_connected_servers()) if self.mcp_bridge else 0
+        mcp_count = dedalus_count + direct_count
         mcp_text = f" │ MCP: {mcp_count}" if mcp_count else ""
         session_text = escape(panel.session_id) if panel and panel.session_id else "New Chat"
 
@@ -624,6 +653,14 @@ class WingmanApp(App):
                 kwargs["mcp_servers"] = panel.mcp_servers
             if self.coding_mode:
                 kwargs["tools"] = create_tools(panel.working_dir, panel.panel_id, panel.session_id)
+            
+            # Add MCP tools from direct bridge connections (as callable functions)
+            if self.mcp_bridge and self.mcp_bridge.is_initialized:
+                mcp_callables = await self.mcp_bridge.create_tool_callables()
+                if mcp_callables:
+                    if "tools" not in kwargs:
+                        kwargs["tools"] = []
+                    kwargs["tools"].extend(mcp_callables)
 
 
             # Set session context for checkpoint tracking
@@ -1131,7 +1168,26 @@ class WingmanApp(App):
         panel = self.active_panel
         if not panel:
             return
-        self.push_screen(MCPModal(panel.mcp_servers.copy()), self._on_mcp_action)
+
+        # Combine direct MCP configs and Dedalus servers
+        servers: list[str] = []
+
+        # Add direct-connected servers with [D] prefix
+        if self.mcp_bridge:
+            for url in self.mcp_bridge.get_connected_servers():
+                # Find config name for this URL
+                name = url
+                for cfg_name, cfg in self.mcp_configs.items():
+                    if cfg.url == url:
+                        name = cfg_name
+                        break
+                servers.append(f"[D] {name}")
+
+        # Add Dedalus/marketplace servers with [M] prefix
+        for s in panel.mcp_servers:
+            servers.append(f"[M] {s}")
+
+        self.push_screen(MCPModal(servers), self._on_mcp_action)
 
     def _on_mcp_action(self, result: tuple[str, str | None] | None) -> None:
         if not result:
@@ -1141,13 +1197,28 @@ class WingmanApp(App):
             return
         action, server = result
         if action == "delete" and server:
-            if server in panel.mcp_servers:
-                panel.mcp_servers.remove(server)
-                self.notify(f"Removed: {server}", timeout=2.0)
-                self._update_status()
-            # Reopen modal with updated list
-            if panel.mcp_servers:
+            # Handle prefixed servers
+            if server.startswith("[D] "):
+                # Direct servers come from config, can't delete via UI
+                self.notify("Direct servers are configured in mcp.json", timeout=3.0)
                 self._show_mcp_modal()
+            elif server.startswith("[M] "):
+                # Dedalus/marketplace servers can be deleted
+                actual_server = server[4:]  # Remove "[M] " prefix
+                if actual_server in panel.mcp_servers:
+                    panel.mcp_servers.remove(actual_server)
+                    self.notify(f"Removed: {actual_server}", timeout=2.0)
+                    self._update_status()
+                # Reopen modal with updated list
+                self._show_mcp_modal()
+            else:
+                # Legacy (no prefix) - try direct removal
+                if server in panel.mcp_servers:
+                    panel.mcp_servers.remove(server)
+                    self.notify(f"Removed: {server}", timeout=2.0)
+                    self._update_status()
+                if panel.mcp_servers:
+                    self._show_mcp_modal()
         elif action == "add":
             self.action_add_mcp()
 
